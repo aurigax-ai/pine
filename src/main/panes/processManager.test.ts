@@ -56,7 +56,14 @@ const sandboxedWorkspaces = new Set<string>()
 
 const registry = registerProcessMethods({
   isSandboxed: (workspaceId) => sandboxedWorkspaces.has(workspaceId),
-  reach: ownWorkspaceReach(),
+  reach: ownWorkspaceReach((id) =>
+    id === 'script_ostia_scoped'
+      ? {
+          scope: { kind: 'limited', groups: [], workspaces: ['ws2'], ownWorkspaces: false },
+          created: [],
+        }
+      : undefined,
+  ),
   openTab: async (req) => {
     if (openFails) return null
     opened.push(req)
@@ -285,6 +292,7 @@ const SCRIPT_TOKENS: Record<string, Capability[]> = {
   ostia_full: ['process', 'all-workspaces'],
   ostia_no_reach: ['process'],
   ostia_no_process: ['all-workspaces'],
+  ostia_scoped: ['process'],
 }
 setScriptTokenCheck((token) => {
   const caps = SCRIPT_TOKENS[token]
@@ -473,6 +481,31 @@ describe('process.run from a script token', () => {
         'needs-elevation: process',
       )
     }
+    expect(written).toEqual([])
+  })
+
+  it('reaches only the processes and workspaces in a limited scope', async () => {
+    const theirs = await start(await client(agent), 'pnpm dev', 'web')
+    const scoped = await client({ token: 'ostia_scoped' } as PaneIdentity)
+    await expect(
+      scoped.sendRequest('process.run', { cmd: 'ls', workspace: 'ws1' }),
+    ).rejects.toThrow('needs-elevation: all-workspaces')
+    const mine = await scoped.sendRequest<Started>('process.run', {
+      cmd: 'make',
+      name: 'build',
+      workspace: 'ws2',
+    })
+    const list = await scoped.sendRequest<ProcessInfo[]>('process.list')
+    expect(list.map((p) => p.name)).toEqual(['build'])
+    await expect(scoped.sendRequest('process.info', { id: theirs.id })).resolves.toMatchObject({
+      error: 'not-found',
+    })
+    await expect(scoped.sendRequest('process.kill', { id: theirs.id })).resolves.toMatchObject({
+      ok: false,
+    })
+    await expect(scoped.sendRequest('process.info', { id: mine.id })).resolves.toMatchObject({
+      name: 'build',
+    })
     expect(written).toEqual([])
   })
 

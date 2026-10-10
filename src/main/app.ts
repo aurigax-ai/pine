@@ -32,6 +32,7 @@ import {
   managerAgents,
   parseManagerSettings,
 } from '../shared/agents/managerSettings'
+import { fmt } from '../shared/app/dict'
 import type { DiscreteGpuInfo } from '../shared/app/discreteGpu'
 import { clampZoom, zoomFactor } from '../shared/app/zoom'
 import { appEnv } from '../shared/appEnv'
@@ -108,8 +109,14 @@ import {
 } from './approvals/capabilityStore'
 import { registerPermissionAsk } from './approvals/permissionAsk'
 import { questions, registerQuestions } from './approvals/questions'
-import { createReach } from './approvals/reach'
-import { registerScriptTokenMethods, verifyScriptToken } from './approvals/scriptTokens'
+import { type ReachListing, createReach } from './approvals/reach'
+import {
+  checkScriptToken,
+  recordCreatedWorkspace,
+  registerScriptTokenMethods,
+  retireLegacyScriptTokens,
+  scriptTokenScope,
+} from './approvals/scriptTokens'
 import { ArtifactCompiler } from './artifacts/artifactCompiler'
 import { ArtifactFolders, registerArtifactIpc } from './artifacts/artifactFolders'
 import { loadEsbuild } from './artifacts/esbuildService'
@@ -1414,6 +1421,14 @@ setCapFilter((conn, cap) => {
   return workspaceSandboxes.resolved(workspaceId).controls.allWorkspaces
 })
 
+async function workspaceListing(): Promise<ReachListing> {
+  const [workspaces, groups] = await Promise.all([
+    listWorkspaces({ execCommand, windowIds }),
+    listWorkspaceGroups({ execCommand, windowIds }),
+  ])
+  return { workspaces, groups }
+}
+
 const reach = createReach({
   mode: loadReachMode,
   home: homedir(),
@@ -1424,15 +1439,12 @@ const reach = createReach({
     ...workspaceSandboxes.settings(workspaceId),
     enabled: workspaceSandboxes.isEnabled(workspaceId),
   }),
-  workspaces: async () => {
-    const [workspaces, groups] = await Promise.all([
-      listWorkspaces({ execCommand, windowIds }),
-      listWorkspaceGroups({ execCommand, windowIds }),
-    ])
-    return { workspaces, groups }
-  },
+  workspaces: workspaceListing,
   ask: (ask) => approvals()?.request(ask) ?? null,
   agentGroupsChanged: (placements) => broadcast('reach:agent-groups-changed', placements),
+  scriptScope: (tokenId) => scriptTokenScope(scriptTokensPath(), tokenId),
+  scriptCreated: (tokenId, workspaceId) =>
+    recordCreatedWorkspace(scriptTokensPath(), tokenId, workspaceId),
 })
 ipcMain.handle('reach:agent-groups', () => reach.agentGroups())
 
@@ -2844,7 +2856,8 @@ function managerLaunchArgv(argv: string[], resume: AgentResume | null): string[]
 }
 
 const managerResumePath = (): string => storePath('manager-resume', 'global')
-const scriptTokensPath = (): string => storePath('script-tokens', 'global')
+const scriptTokensPath = (): string => storePath('script-tokens-v2', 'global')
+const retiredScriptTokensPath = (): string => storePath('retired-script-tokens', 'global')
 
 function spawnManagerPty(req: {
   paneId: string
@@ -3785,6 +3798,7 @@ app.whenReady().then(() => {
     execCommand,
   })
   registerBusMethods({
+    inScope: reach.inScope,
     managerSendAllowed: () => managerLimiter?.busAllowed() ?? true,
     sent: () => telemetry?.count('agents', 'bus_message'),
     announce: (from, to, text) => {
@@ -4030,6 +4044,7 @@ app.whenReady().then(() => {
     ptyPid,
     windowIds,
     waking: isWaking,
+    reach,
   })
   registerGatewayMethods()
   const tailnet = createTailnet({
@@ -4111,8 +4126,26 @@ app.whenReady().then(() => {
     ownedGuest: (paneId, senderWindowId) => ownedGuest(browserPanes, paneId, senderWindowId),
     reach,
   })
-  registerScriptTokenMethods(scriptTokensPath)
-  setScriptTokenCheck((token) => verifyScriptToken(scriptTokensPath(), token))
+  const retiredTokens = retireLegacyScriptTokens(
+    storePath('script-tokens', 'global'),
+    retiredScriptTokensPath(),
+  )
+  if (retiredTokens.length > 0) {
+    const text = mainStrings().native.scriptTokensRetired
+    postNotification(notifyDeps, {
+      title: fmt(text.title, { count: retiredTokens.length }),
+      body: fmt(text.body, { names: retiredTokens.join(', ') }),
+      from: 'script-tokens',
+    })
+  }
+  registerScriptTokenMethods({
+    path: scriptTokensPath,
+    retiredPath: retiredScriptTokensPath,
+    listing: workspaceListing,
+  })
+  setScriptTokenCheck((token) =>
+    checkScriptToken({ path: scriptTokensPath(), retiredPath: retiredScriptTokensPath() }, token),
+  )
   registerControlServer({
     execCommand,
     listCommandsFor,
@@ -4121,6 +4154,7 @@ app.whenReady().then(() => {
     windowOfWorkspace: workspaceWindowId,
     primaryWindow: primaryWindowId,
     byAgent: reach.byAgent,
+    reach,
   })
   writeControlInfo(controlInfoPath(), controlSocketPath(), process.pid)
   if (keepShellsOn()) ensureKeptPlumbing()

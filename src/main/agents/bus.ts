@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { ErrorCodes, ResponseError } from 'vscode-jsonrpc/node'
 import { type BusDelivery, busContext, busPreview } from '../../shared/agents/busMessages'
 import { ensureCaps } from '../approvals/controlElevation'
+import type { Reach } from '../approvals/reach'
 import { registerControlMethod } from '../control/controlServer'
 import { type PaneIdentity, resolveExternal } from '../control/idRegistry'
 import { loadJson, saveJson, storePath } from '../platform/jsonStore'
@@ -174,6 +175,7 @@ export interface BusDeps {
   sent?: () => void
   announce: (from: PaneIdentity, to: PaneIdentity, text: string) => void
   hibernated: (pane: PaneIdentity) => Promise<boolean>
+  inScope?: Reach['inScope']
 }
 
 function receiverOf(to: unknown): PaneIdentity | undefined {
@@ -212,7 +214,9 @@ export function registerBusMethods(deps: BusDeps): void {
         await ensureCaps(
           ctx.authed,
           ctx.identity,
-          script ? ['send-other-pane', 'all-workspaces'] : ['send-other-pane'],
+          script && !(await deps.inScope?.(ctx, receiver.workspaceId))
+            ? ['send-other-pane', 'all-workspaces']
+            : ['send-other-pane'],
           'bus.send',
           `to ${to}`,
         )

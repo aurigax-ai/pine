@@ -20,10 +20,11 @@ import type {
   TerminalStateSnapshot,
 } from '../../shared/types'
 import { ensureCaps, needsElevation } from '../approvals/controlElevation'
+import type { Reach, ScriptReach } from '../approvals/reach'
 import { privateTmpDir, socketPath } from '../platform/privateTmp'
 import { SANDBOXED_REFUSAL } from '../sandbox/sandboxedCaller'
 import { SCRIPT_COMMANDS, externalPaneMessage, internalPaneArgs } from './commandArgs'
-import { type AuthedConn, authenticate, connHasCap } from './controlAuth'
+import { type AuthedConn, authenticate, connHasCap, scriptExpired } from './controlAuth'
 import { type PaneIdentity, resolveExternal } from './idRegistry'
 
 export function controlSocketPath(): string {
@@ -85,6 +86,33 @@ export function registerTargetableMethod(name: string, method: ControlMethod): v
   registerControlMethod(name, { ...method, targetable: true })
 }
 
+const GROUP_COMMANDS: ReadonlySet<string> = new Set([
+  'workspace.hibernateGroupAgents',
+  'workspace.resumeGroupAgents',
+])
+
+function groupArg(args: unknown): unknown {
+  return typeof args === 'object' && args !== null ? (args as { group?: unknown }).group : undefined
+}
+
+function scriptTargetInScope(
+  scoped: ScriptReach | null,
+  id: string,
+  target: CommandTarget,
+  args: unknown,
+): boolean {
+  if (!scoped) return false
+  if (target.workspaceId) {
+    if (!scoped.covers(target.workspaceId)) return false
+    return (
+      !GROUP_COMMANDS.has(id) || scoped.hasGroup(scoped.confirmedGroup(target.workspaceId) ?? '')
+    )
+  }
+  const group = scoped.groupNamed(groupArg(args))
+  if (id === 'workspace.new') return scoped.ownWorkspaces && scoped.hasGroup(group ?? '')
+  return id === 'workspace.groupColor' && scoped.hasGroup(group ?? '')
+}
+
 function actingPane(
   authed: AuthedConn,
   params: unknown,
@@ -113,6 +141,7 @@ export interface ControlServerDeps {
   windowOfWorkspace?: (workspaceId: string) => string | undefined
   primaryWindow?: () => string | undefined
   byAgent?: <T>(run: () => Promise<T>) => Promise<T>
+  reach?: Pick<Reach, 'scriptReach' | 'recordCreated'>
 }
 
 let server: Server | null = null
@@ -136,7 +165,12 @@ export function registerControlServer(deps: ControlServerDeps, socketPathOverrid
     const requireIdentity = (callers: ControlCallers, scripts = false): PaneIdentity => {
       if (!authed) throw unauthenticatedError('call hello first')
       const me = resolveExternal(authed.externalId)
-      if (!me) throw unauthenticatedError('unknown identity')
+      if (!me || (me.kind === 'script' && me.token !== authed.scriptSession)) {
+        throw unauthenticatedError('unknown identity')
+      }
+      if (me.kind === 'script' && scriptExpired(me.externalId)) {
+        throw unauthenticatedError('token-expired: this script token has expired')
+      }
       if (!callerAllowed(me, callers, scripts)) {
         throw new ResponseError(ErrorCodes.InvalidRequest, `not-available-to-${me.kind}`)
       }
@@ -209,11 +243,14 @@ export function registerControlServer(deps: ControlServerDeps, socketPathOverrid
         if (!script && target.workspaceId !== me.workspaceId && deps.isSandboxed(me.workspaceId)) {
           throw new ResponseError(ErrorCodes.InvalidRequest, SANDBOXED_REFUSAL)
         }
-        const crossTarget =
-          script ||
-          target.paneId !== me.paneId ||
-          target.windowId !== me.windowId ||
-          target.workspaceId !== me.workspaceId
+        const scoped = script
+          ? ((await deps.reach?.scriptReach({ identity: me, authed })) ?? null)
+          : null
+        const crossTarget = script
+          ? !scriptTargetInScope(scoped, params.id, target, args)
+          : target.paneId !== me.paneId ||
+            target.windowId !== me.windowId ||
+            target.workspaceId !== me.workspaceId
 
         const desc = deps
           .listCommandsFor(target.windowId ?? me.windowId)
@@ -255,6 +292,11 @@ export function registerControlServer(deps: ControlServerDeps, socketPathOverrid
         }
         const exec = (): Promise<CommandResult> => deps.execCommand(target, params.id, args)
         const result = await (deps.byAgent ? deps.byAgent(exec) : exec())
+        const createdId = (result.ok ? (result.result as { workspaceId?: unknown }) : undefined)
+          ?.workspaceId
+        if (scoped && params.id === 'workspace.new' && typeof createdId === 'string') {
+          deps.reach?.recordCreated({ identity: me, authed }, createdId)
+        }
         if (result.ok || !pane) return result
         return {
           ...result,
@@ -263,18 +305,24 @@ export function registerControlServer(deps: ControlServerDeps, socketPathOverrid
       },
     )
 
-    conn.onRequest('pane.info', (params?: { paneId?: string }): TerminalStateSnapshot | null => {
-      const me = requireIdentity('panes', true)
-      if (authed && !connHasCap(authed, 'read-board')) throw needsElevation('read-board')
-      const script = me.kind === 'script'
-      if (!params?.paneId) {
-        if (script) throw new ResponseError(ErrorCodes.InvalidParams, 'bad-request: paneId')
-        return deps.getTerminalState(me.paneId) ?? null
-      }
-      const other = resolveExternal(params.paneId)
-      if (other?.kind !== 'pane' || (script && other.manager)) return null
-      return deps.getTerminalState(other.paneId) ?? null
-    })
+    conn.onRequest(
+      'pane.info',
+      async (params?: { paneId?: string }): Promise<TerminalStateSnapshot | null> => {
+        const me = requireIdentity('panes', true)
+        if (!authed) throw unauthenticatedError('call hello first')
+        if (!connHasCap(authed, 'read-board')) throw needsElevation('read-board')
+        const script = me.kind === 'script'
+        if (!params?.paneId) {
+          if (script) throw new ResponseError(ErrorCodes.InvalidParams, 'bad-request: paneId')
+          return deps.getTerminalState(me.paneId) ?? null
+        }
+        const other = resolveExternal(params.paneId)
+        if (other?.kind !== 'pane' || (script && other.manager)) return null
+        const scoped = script ? await deps.reach?.scriptReach({ identity: me, authed }) : null
+        if (scoped && !scoped.covers(other.workspaceId)) return null
+        return deps.getTerminalState(other.paneId) ?? null
+      },
+    )
 
     conn.onRequest('cwd.get', (): { cwd: string | null } => {
       const me = requireIdentity('panes')

@@ -213,9 +213,16 @@ const CLI_HELP = `ostia — control-socket CLI
   ostia token create <name> --cap <capability>…  make a token for scripts outside Ostia
                                  (launchd jobs, cron, a dispatcher). It can hold only
                                  read-board, read-other-pane, type-other-pane, send-other-pane,
-                                 process, kill-pane, notify and all-workspaces, asks the human
-                                 first
-                                 (settings-write plus those capabilities) and is printed once.
+                                 process, kill-pane and notify (--preset readonly|coordinator
+                                 picks a set), asks the human first (settings-write plus those
+                                 capabilities) and is printed once. --scope all reaches every
+                                 workspace (as all-workspaces); --scope group:<name|id> and
+                                 --scope workspace:<name|id> (repeatable) limit it to those, and
+                                 --own-workspaces adds the workspaces it creates in those groups.
+                                 Outside its scope a workspace is hidden from lists and refused
+                                 with needs-elevation. --expires 7d|30d|90d|1y|YYYY-MM-DD|never
+                                 (default 90d; never needs --yes-never-expires); an expired token
+                                 is refused with token-expired.
                                  A script sets OSTIA_TOKEN to it; with OSTIA_SOCKET unset, ostia
                                  finds the socket in control.json in the app data folder.
                                  Scripts reach only these methods: whoami, docs, command.list
@@ -231,16 +238,21 @@ const CLI_HELP = `ostia — control-socket CLI
                                  (kill-pane), workspace.resumeAgents and
                                  workspace.resumeGroupAgents (type-other-pane). They never ask
                                  the human and get needs-elevation for a capability the token
-                                 lacks. A script has no workspace or pane of its own, so every
-                                 other pane, workspace and process is outside its reach and needs
-                                 all-workspaces on the token, and it must name its target: a
+                                 lacks. A script has no workspace or pane of its own: its reach
+                                 is its scope, and it must name its target: a
                                  pane (pane read, pane rename, pane.info, agent resume), a
                                  workspace (--workspace for process run, agent run, workspace
                                  rename, group, ungroup, describe and the hibernate commands; a
                                  paneId for pane.close) or an id (process info, logs, kill,
                                  restart); a missing one is refused with bad-request
-  ostia token list [--json]      the tokens (never their values)
-  ostia token revoke <id>        delete a token; scripts using it are cut off at once
+  ostia token list [--json]      the tokens (never their values), with scope, expiry and
+                                 last use; tokens from before the upgrade no longer work and
+                                 are refused with token-retired
+  ostia token show <id|name> [--json]  one token
+  ostia token update <id|name> [--name <name>] [--cap …] [--scope …] [--expires …]  change a
+                                 token. Changing its capabilities, scope or expiry prints a new
+                                 value and cuts the old one off at once; --name alone keeps it
+  ostia token revoke <id|name>   delete a token; scripts using it are cut off at once
   ostia vault set <KEY> [--global]  store a secret (value read from stdin, no echo)
   ostia vault get <KEY> [--global]  print a stored secret
   ostia vault ls [--global]        list stored secret keys (never values)

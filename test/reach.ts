@@ -1,7 +1,7 @@
-import { type Reach, createReach } from '../src/main/approvals/reach'
+import { type Reach, type ReachDeps, createReach } from '../src/main/approvals/reach'
 import { emptyWorkspaceSandbox } from '../src/shared/sandbox/sandbox'
 
-export function ownWorkspaceReach(): Reach {
+export function ownWorkspaceReach(scriptScope?: ReachDeps['scriptScope']): Reach {
   return createReach({
     mode: () => 'workspace',
     home: '/nonexistent-home',
@@ -12,5 +12,6 @@ export function ownWorkspaceReach(): Reach {
     workspaces: async () => ({ workspaces: [], groups: [] }),
     ask: () => null,
     agentGroupsChanged: () => {},
+    scriptScope,
   })
 }

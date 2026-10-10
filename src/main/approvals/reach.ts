@@ -1,6 +1,8 @@
 import type { ApprovalOutcome } from '../../shared/permissions/approvals'
 import type { AgentGroupPlacement, ReachMode } from '../../shared/permissions/reach'
+import type { ScriptTokenScope } from '../../shared/permissions/scriptTokens'
 import type { WorkspaceSandbox } from '../../shared/sandbox/sandbox'
+import { normalizeGroupName } from '../../shared/workspaces/workspaceGroups'
 import { connHasCap } from '../control/controlAuth'
 import type { ControlMethodContext } from '../control/controlServer'
 import type { ApprovalAsk } from './approvals'
@@ -30,12 +32,24 @@ export interface ReachDeps {
   workspaces: () => Promise<ReachListing>
   ask: (ask: ApprovalAsk) => Promise<ApprovalOutcome> | null
   agentGroupsChanged: (placements: AgentGroupPlacement[]) => void
+  scriptScope?: (tokenId: string) => { scope: ScriptTokenScope; created: string[] } | undefined
+  scriptCreated?: (tokenId: string, workspaceId: string) => void
+}
+
+export interface ScriptReach {
+  covers: (workspaceId: string) => boolean
+  hasGroup: (groupId: string) => boolean
+  confirmedGroup: (workspaceId: string) => string | undefined
+  groupNamed: (name: unknown) => string | undefined
+  ownWorkspaces: boolean
 }
 
 export interface Reach {
   inScope: (ctx: ReachCaller, workspaceId: string) => Promise<boolean>
   ensure: (ctx: ReachCaller, workspaceId: string, action: string, detail: string) => Promise<void>
   visible: (ctx: ReachCaller) => Promise<(workspaceId: string) => boolean>
+  scriptReach: (ctx: ReachCaller) => Promise<ScriptReach | null>
+  recordCreated: (ctx: ReachCaller, workspaceId: string) => void
   byAgent: <T>(run: () => Promise<T>) => Promise<T>
   agentGroups: () => AgentGroupPlacement[]
   forget: (workspaceId: string) => void
@@ -120,7 +134,39 @@ export function createReach(deps: ReachDeps): Reach {
     return true
   }
 
+  const scriptReach = async (ctx: ReachCaller): Promise<ScriptReach | null> => {
+    if (ctx.identity.kind !== 'script') return null
+    const view = deps.scriptScope?.(ctx.identity.externalId)
+    if (view?.scope.kind !== 'limited') return null
+    const { groups, workspaces, ownWorkspaces } = view.scope
+    const listed = await deps.workspaces().catch(() => NO_WORKSPACES)
+    const confirmedGroup = (workspaceId: string): string | undefined => {
+      const groupId = listed.workspaces.find((w) => w.workspaceId === workspaceId)?.groupId
+      return groupId && !groupsByAgent.byAgent(workspaceId, groupId) ? groupId : undefined
+    }
+    const hasGroup = (groupId: string): boolean => groups.includes(groupId)
+    return {
+      covers: (workspaceId) => {
+        if (!workspaceId) return false
+        if (workspaces.includes(workspaceId)) return true
+        if (ownWorkspaces && view.created.includes(workspaceId)) return true
+        const groupId = confirmedGroup(workspaceId)
+        return groupId !== undefined && hasGroup(groupId)
+      },
+      hasGroup,
+      confirmedGroup,
+      groupNamed: (raw) => {
+        const name = normalizeGroupName(raw)
+        return name ? listed.groups.find((g) => g.name === name)?.groupId : undefined
+      },
+      ownWorkspaces,
+    }
+  }
+
   const inScope = async (ctx: ReachCaller, workspaceId: string): Promise<boolean> => {
+    if (ctx.identity.kind === 'script') {
+      return (await scriptReach(ctx))?.covers(workspaceId) ?? false
+    }
     const callerId = ctx.identity.workspaceId
     if (!callerId || !workspaceId) return false
     if (callerId === workspaceId) return true
@@ -148,6 +194,10 @@ export function createReach(deps: ReachDeps): Reach {
 
   const visible = async (ctx: ReachCaller): Promise<(workspaceId: string) => boolean> => {
     if (connHasCap(ctx.authed, 'all-workspaces')) return () => true
+    if (ctx.identity.kind === 'script') {
+      const scoped = await scriptReach(ctx)
+      return scoped ? scoped.covers : () => false
+    }
     const callerId = ctx.identity.workspaceId
     const mode = deps.mode()
     const groups = await listing(mode)
@@ -179,6 +229,10 @@ export function createReach(deps: ReachDeps): Reach {
     inScope,
     ensure,
     visible,
+    scriptReach,
+    recordCreated: (ctx, workspaceId) => {
+      if (ctx.identity.kind === 'script') deps.scriptCreated?.(ctx.identity.externalId, workspaceId)
+    },
     byAgent,
     agentGroups,
     forget: (workspaceId) => {

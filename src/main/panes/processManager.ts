@@ -364,7 +364,7 @@ export interface ProcessDeps {
   cwdOfPane: (paneId: string) => string | undefined
   agentArgv: (name: string) => string[] | null
   isSandboxed: (workspaceId: string) => boolean
-  reach: Pick<Reach, 'ensure' | 'visible'>
+  reach: Pick<Reach, 'ensure' | 'visible' | 'scriptReach'>
   interruptGraceMs: number
   onChange?: (entry: ProcessEntry) => void
 }
@@ -466,7 +466,7 @@ export function registerProcessMethods(deps: ProcessDeps): ProcessRegistry {
   })
 
   const scriptReach = async (ctx: ControlMethodContext, method: string): Promise<void> => {
-    if (ctx.identity.kind !== 'script') return
+    if (ctx.identity.kind !== 'script' || (await deps.reach.scriptReach(ctx))) return
     await ensureCaps(
       ctx.authed,
       ctx.identity,

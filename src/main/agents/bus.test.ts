@@ -20,10 +20,13 @@ const { markManager, registerPane, registerScript } = await import('../control/i
 const announce = vi.fn()
 let managerMaySend = true
 const asleepPanes = new Set<string>()
+const scriptReaches = new Set<string>()
 registerBusMethods({
   managerSendAllowed: () => managerMaySend,
   announce,
   hibernated: async (pane) => asleepPanes.has(pane.paneId),
+  inScope: async (ctx, workspaceId) =>
+    ctx.identity.kind === 'script' && scriptReaches.has(workspaceId),
 })
 
 const sender = registerPane({ windowId: 'w1', workspaceId: 'ws1', paneId: 'bus-sender' })
@@ -182,6 +185,22 @@ describe('bus.send from a script token', () => {
       {},
       script,
       ['send-other-pane', 'all-workspaces'],
+      'bus.send',
+      `to ${receiver.externalId}`,
+    )
+  })
+
+  it('needs only send-other-pane for a receiver in the token scope', async () => {
+    scriptReaches.add('ws1')
+    try {
+      await send('in scope', receiver.externalId, script)
+    } finally {
+      scriptReaches.clear()
+    }
+    expect(ensureCaps).toHaveBeenCalledWith(
+      {},
+      script,
+      ['send-other-pane'],
       'bus.send',
       `to ${receiver.externalId}`,
     )

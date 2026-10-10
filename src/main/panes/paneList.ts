@@ -1,6 +1,7 @@
 import type { Capability } from '../../shared/capabilities'
 import type { CommandResult, CommandTarget, TerminalStateSnapshot } from '../../shared/types'
-import { registerControlMethod } from '../control/controlServer'
+import type { Reach } from '../approvals/reach'
+import { type ControlMethodContext, registerControlMethod } from '../control/controlServer'
 import { getByPaneId } from '../control/idRegistry'
 
 interface PaneAgentFields {
@@ -63,6 +64,7 @@ export interface PaneListDeps {
   ptyPid: (paneId: string) => number | undefined
   windowIds: () => string[]
   waking: (paneId: string) => boolean
+  reach?: Pick<Reach, 'scriptReach'>
 }
 
 async function listFromEveryWindow<T>(
@@ -137,22 +139,37 @@ export async function listWorkspaceGroups(
 const READ_BOARD: Capability = 'read-board'
 
 export function registerPaneListMethods(deps: PaneListDeps): void {
+  const scoped = async (ctx: ControlMethodContext) => (await deps.reach?.scriptReach(ctx)) ?? null
+
   registerControlMethod('pane.list', {
     cap: READ_BOARD,
     callers: 'all',
     scripts: true,
-    handler: () => listPanes(deps),
+    handler: async (_params, ctx) => {
+      const [scope, panes] = await Promise.all([scoped(ctx), listPanes(deps)])
+      return scope ? panes.filter((p) => scope.covers(p.workspaceId)) : panes
+    },
   })
   registerControlMethod('workspace.list', {
     cap: READ_BOARD,
     callers: 'all',
     scripts: true,
-    handler: () => listWorkspaces(deps),
+    handler: async (_params, ctx) => {
+      const [scope, workspaces] = await Promise.all([scoped(ctx), listWorkspaces(deps)])
+      return scope ? workspaces.filter((w) => scope.covers(w.workspaceId)) : workspaces
+    },
   })
   registerControlMethod('workspace.groups', {
     cap: READ_BOARD,
     callers: 'all',
     scripts: true,
-    handler: () => listWorkspaceGroups(deps),
+    handler: async (_params, ctx) => {
+      const [scope, groups] = await Promise.all([scoped(ctx), listWorkspaceGroups(deps)])
+      if (!scope) return groups
+      return groups.flatMap((g) => {
+        const workspaceIds = g.workspaceIds.filter(scope.covers)
+        return scope.hasGroup(g.groupId) || workspaceIds.length > 0 ? [{ ...g, workspaceIds }] : []
+      })
+    },
   })
 }

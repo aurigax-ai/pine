@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalOutcome } from '../../shared/permissions/approvals'
 import type { AgentGroupPlacement, ReachMode } from '../../shared/permissions/reach'
+import type { ScriptTokenScope } from '../../shared/permissions/scriptTokens'
 import { emptyWorkspaceSandbox } from '../../shared/sandbox/sandbox'
 import type { ApprovalAsk } from './approvals'
 
@@ -11,9 +12,9 @@ const request = vi.fn(async (_ask: ApprovalAsk): Promise<ApprovalOutcome> => 'de
 
 vi.mock('./approvals', () => ({ approvals: () => ({ request }) }))
 
-const { grant, initCaps } = await import('./capabilityStore')
+const { grant, initCaps, setCaps } = await import('./capabilityStore')
 const { setCapFilter } = await import('../control/controlAuth')
-const { registerPane } = await import('../control/idRegistry')
+const { registerPane, registerScript } = await import('../control/idRegistry')
 const { createReach } = await import('./reach')
 
 const home = realpathSync(mkdtempSync(join(tmpdir(), 'reach-runtime-')))
@@ -265,5 +266,93 @@ describe('createReach', () => {
     own.forget('workers')
     expect(own.agentGroups()).toEqual([])
     expect(published).toEqual([placed, [placed[0]], []])
+  })
+})
+
+describe('createReach for script tokens', () => {
+  const scopes: Record<string, { scope: ScriptTokenScope; created: string[] }> = {}
+  const created: [string, string][] = []
+  const scripted = createReach({
+    mode: () => mode,
+    home,
+    workDir: (id) => workDirs[id],
+    isScratch: () => false,
+    hasManager: () => false,
+    sandbox: () => emptyWorkspaceSandbox(),
+    workspaces: async () => listing(),
+    ask,
+    agentGroupsChanged: () => {},
+    scriptScope: (id) => scopes[id],
+    scriptCreated: (id, workspaceId) => created.push([id, workspaceId]),
+  })
+
+  function script(scope: ScriptTokenScope, made: string[] = []) {
+    const id = `script_reach_${++seq}`
+    scopes[id] = { scope, created: made }
+    const identity = registerScript(id)
+    setCaps(id, scope.kind === 'all' ? ['all-workspaces'] : [])
+    return { identity, authed: { externalId: id, paneId: '', workspaceId: '' } }
+  }
+
+  it('reaches the groups of a limited scope even in project mode', async () => {
+    groupOf = { workers: 'g1', elsewhere: 'g1' }
+    const s = script({ kind: 'limited', groups: ['g1'], workspaces: [], ownWorkspaces: false })
+    expect(await scripted.inScope(s, 'workers')).toBe(true)
+    expect(await scripted.inScope(s, 'elsewhere')).toBe(true)
+    expect(await scripted.inScope(s, 'coord')).toBe(false)
+    const sees = await scripted.visible(s)
+    expect(['coord', 'workers', 'elsewhere'].filter(sees)).toEqual(['workers', 'elsewhere'])
+    expect(ask).not.toHaveBeenCalled()
+  })
+
+  it('reaches only the workspaces a limited scope names', async () => {
+    const s = script({ kind: 'limited', groups: [], workspaces: ['coord'], ownWorkspaces: false })
+    expect(await scripted.inScope(s, 'coord')).toBe(true)
+    expect(await scripted.inScope(s, 'workers')).toBe(false)
+    expect(await scripted.inScope(s, '')).toBe(false)
+  })
+
+  it('leaves out a workspace an agent moved into a group of the scope', async () => {
+    groupOf = {}
+    await scripted.byAgent(async () => {
+      groupOf = { workers: 'g1' }
+    })
+    const s = script({ kind: 'limited', groups: ['g1'], workspaces: [], ownWorkspaces: false })
+    expect(await scripted.inScope(s, 'workers')).toBe(false)
+    await expect(scripted.ensure(s, 'workers', 'x', 'y')).rejects.toThrow(
+      'needs-elevation: all-workspaces',
+    )
+    expect(ask).not.toHaveBeenCalled()
+  })
+
+  it('reaches the workspaces the token created only when its scope says so', async () => {
+    const own = script({ kind: 'limited', groups: ['g1'], workspaces: [], ownWorkspaces: true }, [
+      'elsewhere',
+    ])
+    expect(await scripted.inScope(own, 'elsewhere')).toBe(true)
+    const not = script({ kind: 'limited', groups: ['g1'], workspaces: [], ownWorkspaces: false }, [
+      'elsewhere',
+    ])
+    expect(await scripted.inScope(not, 'elsewhere')).toBe(false)
+    scripted.recordCreated(own, 'fresh')
+    expect(created).toContainEqual([own.identity.externalId, 'fresh'])
+    scripted.recordCreated(caller(), 'fresh')
+    expect(created).toHaveLength(1)
+  })
+
+  it('leaves a token whose scope is all to all-workspaces, and gives a pane no script scope', async () => {
+    const all = script({ kind: 'all' })
+    expect(await scripted.scriptReach(all)).toBeNull()
+    expect(await scripted.inScope(all, 'elsewhere')).toBe(false)
+    expect((await scripted.visible(all))('elsewhere')).toBe(true)
+    expect(await scripted.scriptReach(caller())).toBeNull()
+  })
+
+  it('fails closed when the token is gone', async () => {
+    const gone = script({ kind: 'limited', groups: ['g1'], workspaces: [], ownWorkspaces: false })
+    delete scopes[gone.identity.externalId]
+    groupOf = { workers: 'g1' }
+    expect(await scripted.inScope(gone, 'workers')).toBe(false)
+    expect((await scripted.visible(gone))('workers')).toBe(false)
   })
 })

@@ -3404,6 +3404,10 @@ export const en = {
       failed: 'Sign-in did not finish. Return to {product} and try again.',
     },
     updateTitle: 'Update {product}',
+    scriptTokensRetired: {
+      title: '{count} old script tokens stopped working after the {product} upgrade',
+      body: '{names} can no longer connect. Generate new tokens and put them in your scripts.',
+    },
   },
 }
 
@@ -6722,6 +6726,10 @@ export const zhHant: Dict = {
       failed: '登入未完成。請回到 {product} 再試一次。',
     },
     updateTitle: '更新 {product}',
+    scriptTokensRetired: {
+      title: '升級 {product} 後，{count} 個舊版腳本權杖已失效',
+      body: '{names} 無法再連線。請產生新權杖並更新腳本裡的權杖。',
+    },
   },
 }
 
